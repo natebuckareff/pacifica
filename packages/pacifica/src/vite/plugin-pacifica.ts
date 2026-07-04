@@ -102,6 +102,9 @@ function pacificaCorePlugin(options?: PacificaPluginOptions): PluginOption {
         const routes = (await getRouteState()).routes.manifest;
         const match = matchRoute(segments, routes);
         if (match) {
+          /*
+          ok what do we actually need to do here?
+          */
           const json = JSON.stringify(match, null, 2);
           const html = `<html><body><h1>match</h1><pre>${json}</pre></body></html>`;
           res.writeHead(200, { "Content-Type": "text/html" });
