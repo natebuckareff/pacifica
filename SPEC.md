@@ -68,15 +68,16 @@ Filename conventions:
 | Pattern | Meaning |
 |---|---|
 | `index.tsx` | Index page for the enclosing segment |
+| `(name).tsx` | Named index alias — an index page with a meaningful filename |
 | `_name.tsx` | Layout (`_`-prefixed, applies to its directory subtree) |
 | `name.tsx` | Static segment `/name` |
-| `[id].tsx` | Required param `/:id` |
+| `[id].tsx` | Required param |
 | `[[id]].tsx` | Optional param |
 | `[...rest].tsx` | Catch-all |
 | `(group)` | Route group (collapsed, no URL segment) |
 | `name(group).tsx` | Escaped group (segment `name`, layout lifted from `(group)`) |
 | `@slot/` | Parallel route slot (Next.js-style) |
-| `*name.tsx` | Fallback (`*404.tsx`, `*default.tsx`) |
+| `!name.tsx` | Fallback (`!404.tsx`, `!default.tsx`) — `!` because `*` is not Windows-legal in filenames |
 | `(.)x`, `(..)x`, `(..)(..)x`, `(...)x` | Intercepting routes |
 | `name.script.ts(x)` | Route-scoped client script (not a route) |
 | `_name.island.tsx` | **Island boundary layout** (see 3.4) |
@@ -97,6 +98,14 @@ Suffix errors (parse-time):
   hydration root inside a running island; this covers both nested boundary
   layouts and island pages under a boundary.
 - `.island` combined with `.script`.
+
+**Index mapping.** A directory's index page — `index.tsx`, or exactly one
+parenthesized alias file `(name).tsx` — is the page for the enclosing
+segment's own path. Parens on a *directory* form a route group; parens on
+a *file* form an index alias. Neither contributes a URL segment. More than
+one index in a directory (any combination of `index.tsx` and aliases) is a
+parse error. The alias name carries into fragment space: `(home).tsx` →
+`fragments/(home).html` (§8.1) — the meaningful name is the point.
 
 ### 3.2 Fragments and assembly
 
@@ -145,7 +154,8 @@ tree, and:
    (CDN-cacheable); `route`/`request`-class fragments from the origin
    (the server renders just that fragment).
 3. Preloads the target's CSS/JS (from the manifest) and fires the target's
-   query preloads as plain fetches, in parallel with (2).
+   query preloads (derived from the sequence fragments' `queries` lists)
+   as plain fetches, in parallel with (2).
 4. Assembles the fetched sub-sequence by concatenation and swaps the changed
    outlet subtree inside `document.startViewTransition()`.
 5. Disposes islands that left the DOM, hydrates islands that entered it.
@@ -180,8 +190,8 @@ Because island sub-routes live in the same filesystem tree, the build can:
   the build-time SSR output *for the settings sub-route* (its settled or
   fallback state), with that sub-route's preloads and assets. Island
   subtrees are indistinguishable from pages for hard-nav performance.
-- **Lift per-sub-route query preloads** into the manifest so the server
-  streams the right data for deep hard navs.
+- **Record per-sub-route query lists** on the sub-route fragments, so the
+  derived preload set (§9) streams the right data for deep hard navs.
 
 Soft navigation *within* an island subtree is pure solid-router.
 
@@ -225,7 +235,8 @@ toward, expressed as a filename.
 
 ### 3.6 Intercepting and parallel routes
 
-Parsing is implemented (slots `@name`, fallbacks `*name`, intercepts).
+Parsing is implemented (slots `@name`, fallbacks — as `*name`, to be
+renamed `!name` — and intercepts).
 Runtime semantics are **deliberately sequenced last** (see §11): the
 manifest reserves `slots` and `intercept` fields, and the fragment/sequence
 model hosts them naturally (slots are interleaved sub-sequences), but v1
@@ -234,7 +245,7 @@ does not implement their runtime behavior.
 Intended semantics (recorded for later): an intercept applies on soft
 navigation only — PageRouter renders the intercepting fragment into its slot
 while the URL updates; hard navigation to the same URL assembles the
-non-intercepted sequence. Slots render in parallel outlets with `*default`
+non-intercepted sequence. Slots render in parallel outlets with `!default`
 fallbacks resolved per-URL.
 
 ## 4. Data
@@ -431,7 +442,7 @@ chunks interleaved with the fragment stream:
 The client bootstrap pipes pushes into the query cache (`query.set`) before
 or during hydration. For prerendered fragments, the streamed data is the
 **snapshot** (§6.4), never a fresh fetch. For soft navigations nothing is
-streamed: PageRouter fires the manifest-listed preloads itself as plain
+streamed: PageRouter fires the derived preloads (§9) itself as plain
 fetches.
 
 ## 5. Rendering classes
@@ -557,6 +568,12 @@ sorted, values URL-encoded; hash only if length demands):
     id=42&locale=en.json
 ```
 
+> @nate/@claude (2026-07-04): the binding→filename encoding above is under
+> review — parameter values are arbitrary strings (escaping), and key
+> order in the encoded name must be canonical or lookups are ambiguous. A
+> JSON mapping may replace name-encoded bindings. Don't build against this
+> layout yet.
+
 Server lookup per fragment per request: assemble the binding key from the
 fragment's declared inputs, `stat` the path. Hit → serve those bytes
 (response headers still the sequence meet; prerendered artifacts change
@@ -615,19 +632,67 @@ a compatibility promise.
   public/            # user's public dir, copied verbatim
 ```
 
-Fragment layout inside `fragments/` mirrors the route tree; layouts are
-directories of numbered pieces:
-
-```
-fragments/
-  _root/0.html
-  _root/1.html
-  products.html
-  products/$.html
-```
-
 Fragment files are Jinja-executable; `static`-class fragments simply contain
 no Jinja syntax.
+
+### 8.1 Fragment naming
+
+There are two namespaces, and the manifest is the only mapping between
+them:
+
+- **Route space** — URL-shaped (`/[locale]/products`). Appears only as
+  keys in the manifest (`sequences`, the route tree). Params use the same
+  `[name]` syntax as the filesystem — one param representation everywhere.
+- **Fragment space** — filesystem-shaped: fragment names mirror the source
+  tree under `src/routes/` verbatim, minus the `.tsx`/`.ts` extension.
+  Used as artifact paths under `fragments/` and as keys in the manifest's
+  `fragments` section.
+
+Rules:
+
+- A page file maps 1:1: `about.tsx` → `about.html`;
+  `[locale]/products/[id].tsx` → `[locale]/products/[id].html`.
+- A layout becomes a directory of numbered pieces, one more than its
+  outlet count: `_root.tsx` → `_root/0.html`, `_root/1.html`. The `_`
+  prefix is kept.
+- Group directories and index-alias names are kept: `(marketing)/pricing.tsx`
+  → `(marketing)/pricing.html`; `(home).tsx` → `(home).html`; `index.tsx`
+  → `index.html`.
+- The `.island` suffix is kept: `app.island.tsx` → `app.island.html`, so a
+  directory listing distinguishes frozen island bytes from Jinja-executable
+  templates.
+- An island boundary layout contributes **no fragments of its own** — its
+  markup is baked into each sub-route's frozen SSR. Island sub-route
+  fragments are named by their sub-route files (`dashboard/settings.html`),
+  uniform with pages.
+- `.script.ts(x)` files produce no fragments; they surface as assets on
+  sequences.
+
+Fragment names are **opaque tokens** everywhere downstream. A sequence is a
+list of them, and each token is simultaneously the key into the manifest's
+`fragments` section and the relative path under `fragments/` (append
+`.html`). Nothing ever parses a fragment name — brackets, parens, `_`, `!`
+are just bytes. Matching, the one job that historically forced name-encoded
+conventions (`%`, `*`, `?`), instead uses the route tree's explicit
+`segment`/`param` fields. Mirroring the filesystem also makes the alphabet
+Windows-legal by construction: `[id]`, `(group)`, `@slot`, `!404` are valid
+NTFS names, unlike `:id` or `*404`.
+
+Example:
+
+```
+src/routes/                        .pacifica/fragments/
+  _root.tsx                          _root/0.html, _root/1.html
+  (home).tsx                         (home).html
+  about.tsx  + about.script.ts       about.html            (script → assets)
+  !404.tsx                           !404.html
+  (marketing)/_layout.tsx            (marketing)/_layout/0.html, …/1.html
+  (marketing)/pricing.tsx            (marketing)/pricing.html
+  [locale]/products/[id].tsx         [locale]/products/[id].html
+  dashboard/_dash.island.tsx         (no fragment — baked into sub-routes)
+  dashboard/settings.tsx             dashboard/settings.html   (frozen island SSR)
+  app.island.tsx                     app.island.html
+```
 
 ## 9. `manifest.json`
 
@@ -640,16 +705,15 @@ Sections: `version`, `routes`, `sequences`, `fragments`, `queries`.
   "routes": {
     "segment": "/",
     "sequence": "/",                        // key into "sequences"
-    "fallback": { "404": { "sequence": "/404" } },
+    "fallback": { "404": { "sequence": "/!404" } },
     "children": [                           // pre-sorted by specificity
       {
         "segment": "products",
         "sequence": "/products",
         "children": [
           {
-            "segment": ":id", "param": "id",
-            "sequence": "/products/:id",
-            "preloads": ["product"]         // queries to stream/prefetch
+            "segment": "[id]", "param": "id",
+            "sequence": "/products/[id]"
           }
         ]
       },
@@ -664,8 +728,8 @@ Sections: `version`, `routes`, `sequences`, `fragments`, `queries`.
   },
 
   "sequences": {
-    "/products/:id": {
-      "fragments": ["_root/0", "products/$", "_root/1"],  // concat order
+    "/products/[id]": {
+      "fragments": ["_root/0", "products/[id]", "_root/1"],  // concat order
       "cacheControl": "public, s-maxage=300, stale-while-revalidate=3600",
       "linkHeader": "</assets/products-D3ax.css>; rel=preload; as=style, …",
       "assets": {
@@ -681,7 +745,7 @@ Sections: `version`, `routes`, `sequences`, `fragments`, `queries`.
                     "cacheControl": "…" },
     "_root/1":    { "class": "startup", "queries": ["site-config"],
                     "cacheControl": "…" },
-    "products/$": { "class": "route",   "queries": ["product"],
+    "products/[id]": { "class": "route", "queries": ["product"],
                     "cacheControl": "…",
                     "prerender": { "inputs": ["param:id", "param:locale"] } }
   },
@@ -701,6 +765,16 @@ Notes:
   assets) for hard navs; `fragments` entries carry per-fragment class,
   queries, cache headers (used when a fragment is served alone for soft
   nav), and prerender coverage.
+- Param segments use the filesystem's `[name]` syntax — one param
+  representation everywhere. Matchers identify param nodes by the `param`
+  field; the segment string of a param node is never parsed.
+- There is **no `preloads` field**: the queries to prefetch/stream for a
+  route are derived as the union of its sequence fragments' `queries`
+  lists (island sub-route fragments carry their query lists like any
+  other fragment). Denormalizing this back into the route tree is a
+  possible later optimization, not a manifest shape.
+- Fallbacks are not URLs, so their sequences are keyed by fragment-space
+  name (`"/!404"`); sequence keys are route paths *or* fallback names.
 - Invariant: **every decision a server or client router must make is a
   lookup in this file.** If an implementation needs logic beyond
   tree-walking, string assembly, and template execution, the manifest is
@@ -767,7 +841,7 @@ target: Rust — a *port*, started only once this spec stabilizes):
    child-overwrite bug in `mergeManifestRoutes`~~ — fixed 2026-07-03;
    params/catch-all/fallback matching; restore source↔fragment
    association; `.island` suffix parsing + boundary/leaf flags and their
-   parse errors, §3.4–3.5).
+   parse errors, §3.4–3.5; fallback prefix rename `*name` → `!name`).
 3. Island system port (transform + `Island` + hydration registry **with
    disposal**, designed in from the start).
 4. Build pipeline (§7) — port of v1 onto v2 routes, plus fragment split.
