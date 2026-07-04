@@ -157,6 +157,7 @@ function getRouteConfigFromDirTree(
     if (isScript(child)) {
       scripts ??= [];
       scripts.push(child.src);
+      continue;
     }
 
     // need to recursive into any child group directories and collapse them so

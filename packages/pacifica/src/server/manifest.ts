@@ -307,10 +307,9 @@ function mergeManifestRoutes(
     for (const [segment, rightChild] of Object.entries(right.children)) {
       merged.children ??= {};
       const leftChild = merged.children[segment];
-      if (leftChild) {
-        merged.children[segment] = mergeManifestRoutes(leftChild, rightChild);
-      }
-      merged.children[segment] = rightChild;
+      merged.children[segment] = leftChild
+        ? mergeManifestRoutes(leftChild, rightChild)
+        : rightChild;
     }
   }
 
