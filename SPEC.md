@@ -79,7 +79,24 @@ Filename conventions:
 | `*name.tsx` | Fallback (`*404.tsx`, `*default.tsx`) |
 | `(.)x`, `(..)x`, `(..)(..)x`, `(...)x` | Intercepting routes |
 | `name.script.ts(x)` | Route-scoped client script (not a route) |
-| `_.island.tsx` | **Island boundary layout** (see 3.4) |
+| `_name.island.tsx` | **Island boundary layout** (see 3.4) |
+| `name.island.tsx` | **Leaf island page** (see 3.5) |
+
+`.island` is a **type suffix** on the same axis as `.script`: it says what
+kind of module the file is, orthogonal to what the route segment is named.
+The `_` prefix remains the layout/page discriminator, so `_name.island.tsx`
+is an island *boundary layout* and `name.island.tsx` (or `index.island.tsx`)
+is a *leaf island page*. Island-ness is communicated **only** through
+filenames — route scanning never reads file contents (no marker exports),
+so the route tree is derivable by any tool (dev server rescans, the build,
+the Rust server's manifest consumers) without JS module semantics.
+
+Suffix errors (parse-time):
+
+- `.island` anywhere below an existing island boundary — there is no second
+  hydration root inside a running island; this covers both nested boundary
+  layouts and island pages under a boundary.
+- `.island` combined with `.script`.
 
 ### 3.2 Fragments and assembly
 
@@ -139,9 +156,18 @@ specificity logic at runtime.
 
 ### 3.4 Island subtrees and IslandRouter
 
-A route subtree is **island-owned** when its layout is an island boundary
-file (`_.island.tsx`). Below that node, routing is client-side via
-IslandRouter (a wrapper over `@solidjs/router`).
+A route subtree is **island-owned** when its layout carries the `.island`
+type suffix (`_name.island.tsx`). Below that node, routing is client-side
+via IslandRouter (a wrapper over `@solidjs/router`). The boundary file *is*
+that node's layout — a directory cannot have both a static layout and an
+island boundary. Static chrome around an island region is expressed by
+nesting: a static `_shell.tsx` in the parent directory, the boundary layout
+one level down. Sub-route files below the boundary stay completely ordinary
+(`index.tsx`, `settings.tsx`, `[id].tsx`); their island-ness is inherited
+from the nearest boundary ancestor, and nested layouts below it become
+nested solid-router layouts via codegen, no special naming. The DX story:
+want client-side routing under `/dashboard`? Rename `_dashboard.tsx` to
+`_dashboard.island.tsx`.
 
 Because island sub-routes live in the same filesystem tree, the build can:
 
@@ -179,6 +205,23 @@ assigns a stable ID, records the component's import source, SSRs its content
 into the enclosing fragment, and registers it in the route's client entry
 for hydration. Leaf islands may use `usePageQuery` (§4.4) and solid-router
 queries/actions, but not IslandRouter.
+
+**Leaf island pages.** A page file with the `.island` suffix
+(`name.island.tsx`, `index.island.tsx`) is a page whose default export *is*
+the island component — behaviorally identical to a substitution page
+containing exactly one full-width `<Island>`, minus the wrapper file. Same
+rules as any leaf island: `usePageQuery` and solid-router queries/actions,
+no IslandRouter. The build reuses the leaf-island path with the whole page
+fragment as the splice target and emits one hydration entry.
+
+A property worth designing around: island SSR output is frozen at build
+time and server-side Jinja never touches island markup (§4.4), so a leaf
+island page's fragment contains **no substitution slots at all** — it is
+always `static`-class, served as raw bytes from CDN, with its data riding
+in via the injected JSON blob. A static shell layout plus a leaf island
+page is the intended shape for a simple SPA: zero origin rendering, still
+fully dynamic after hydration. This is the pattern §5 advises pushing sites
+toward, expressed as a filename.
 
 ### 3.6 Intercepting and parallel routes
 
@@ -719,10 +762,12 @@ target: Rust — a *port*, started only once this spec stabilizes):
       silently) — folded into §4.4 and §6.4.
    A failed spike changes the affected API's *mechanism*, not the
    architecture (e.g. proxy → explicit typed components).
-2. Route matching completion + known parser fixes (`.script.ts` files leak
-   into route segments — missing `continue` in `routes.ts`; child-overwrite
-   bug in `mergeManifestRoutes`; params/catch-all/fallback matching;
-   restore source↔fragment association).
+2. Route matching completion + known parser fixes (~~`.script.ts` files
+   leak into route segments — missing `continue` in `routes.ts`;
+   child-overwrite bug in `mergeManifestRoutes`~~ — fixed 2026-07-03;
+   params/catch-all/fallback matching; restore source↔fragment
+   association; `.island` suffix parsing + boundary/leaf flags and their
+   parse errors, §3.4–3.5).
 3. Island system port (transform + `Island` + hydration registry **with
    disposal**, designed in from the start).
 4. Build pipeline (§7) — port of v1 onto v2 routes, plus fragment split.
