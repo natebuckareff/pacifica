@@ -40,9 +40,10 @@ the server dumb.**
 | **sequence** | The manifest-defined ordered list of fragment names for a route's full page. The unit of hard navigation. Assembled by concatenation — by the server (hard nav) and by PageRouter (soft nav, the sub-sequence below the shared layout). |
 | **query** | A named, typed data dependency (`pageQuery`). The only channel between server data and UI, and the only thing that crosses the page/island boundary. |
 | **inputs** | The declared request facets a query's result may vary on. Drives cache class derivation and handler constraint. |
-| **class** | The derived cacheability of a fragment: `static`, `startup`, `route`, or `request`. Never authored directly. |
-| **binding** | A concrete assignment of named `param`/`search` inputs, e.g. `{locale: "en"}`. The key of a prerendered artifact. |
-| **prerendered artifact** | A fragment rendered at build time for a specific binding, together with its query result snapshots. |
+| **class** | The derived cacheability of a fragment: `static`, `route`, or `request`. Never authored directly. |
+| **binding** | A concrete assignment of route **params** (only params — §6), e.g. `{locale: "en"}`. The key of a prerendered artifact. |
+| **prerendered artifact** | A fragment rendered at build time for a specific binding, with its query pushes inlined. Final bytes under `html/`. |
+| **push** | An inline `<script>` carrying one query result, embedded in a fragment's bytes by whoever rendered the fragment (§4.5). |
 | **envelope** | The JSON response shape shared by all query/action endpoints. |
 | **PageRouter** | The client runtime for page-level soft navigation (fragment fetch + assembly, swap, View Transitions, island lifecycle). |
 | **IslandRouter** | A thin wrapper around `@solidjs/router` used *inside* islands, client-side only. |
@@ -105,7 +106,7 @@ segment's own path. Parens on a *directory* form a route group; parens on
 a *file* form an index alias. Neither contributes a URL segment. More than
 one index in a directory (any combination of `index.tsx` and aliases) is a
 parse error. The alias name carries into fragment space: `(home).tsx` →
-`fragments/(home).html` (§8.1) — the meaningful name is the point.
+fragment `(home)` (§8.1) — the meaningful name is the point.
 
 ### 3.2 Fragments and assembly
 
@@ -149,16 +150,24 @@ tree, and:
 
 1. Diffs the target route's sequence against the currently mounted one.
    Only fragments below the deepest shared layout are needed.
-2. Fetches each needed fragment: `static`/`startup`-class (and
-   prerender-hit) fragments as plain files from the fragments path
-   (CDN-cacheable); `route`/`request`-class fragments from the origin
-   (the server renders just that fragment).
-3. Preloads the target's CSS/JS (from the manifest) and fires the target's
-   query preloads (derived from the sequence fragments' `queries` lists)
-   as plain fetches, in parallel with (2).
+2. Fetches each needed fragment: `static`-class fragments and prerender
+   hits as plain files from `html/_pacifica/` (CDN-served, §8);
+   `route`/`request`-class fragments from the origin (the server renders
+   just that fragment, pushes inlined).
+3. Preloads the target's CSS/JS (from the manifest), in parallel with (2).
 4. Assembles the fetched sub-sequence by concatenation and swaps the changed
-   outlet subtree inside `document.startViewTransition()`.
+   outlet subtree inside `document.startViewTransition()`. Scripts inside
+   fetched fragment bytes (pushes, island boundary-state scripts) are inert
+   when inserted via `innerHTML`; PageRouter **re-creates each script
+   element** so they execute (§4.5).
 5. Disposes islands that left the DOM, hydrates islands that entered it.
+6. Fetches any of the target route's queries still missing from the query
+   cache after the swapped fragments' pushes have run (the self-fetch rule,
+   §4.5).
+
+> @nate: Since PageRouter is a full-stack router, we should be careful to differentiate between client-side PageRouter and server-side. For example, (6) talks about the client-side PageRouter fetching missing query results, which is correct, but the server-side PageRouter also neds to fetch and then stream the results...wait isn't there a problem here? If a server-side fetch takes a long time, the client-side PageRouter may conclude that it needs to fetch that query itself. However, that may duplicate work if the push is still in-flight from the server
+
+> @nate: Thinking about this some more. For a `usePageQuery` that executes on the client, it receives a `Promise`. That promise is pending until the origin server streams a push for that automatically preloaded query? So when and how excatly does the client runtime (ie PageRouter) decide that a query is not inlined, is not in-flight, and it should fetch for it itself? This can happen in the case of CDN-served content right?
 
 Route matching is identical on client and server: walk the manifest tree,
 children pre-sorted by the build (static > param > optional > catch-all), no
@@ -188,10 +197,11 @@ Because island sub-routes live in the same filesystem tree, the build can:
 - **Emit a fragment per sub-route.** Hard navigation to
   `/dashboard/settings` assembles a sequence whose island region contains
   the build-time SSR output *for the settings sub-route* (its settled or
-  fallback state), with that sub-route's preloads and assets. Island
+  fallback state), with that sub-route's pushes and assets. Island
   subtrees are indistinguishable from pages for hard-nav performance.
-- **Record per-sub-route query lists** on the sub-route fragments, so the
-  derived preload set (§9) streams the right data for deep hard navs.
+- **Record per-sub-route query lists** on the sub-route fragments, so
+  deep hard navs carry the right pushes and the client self-fetch rule
+  (§4.5) knows what to fill in.
 
 Soft navigation *within* an island subtree is pure solid-router.
 
@@ -209,6 +219,8 @@ where the click originated.
 <Counter client:load />        // sugar, or explicitly:
 <Island><Counter /></Island>
 ```
+
+> @nate: Solid 2.0 does not have directives anymore.
 
 The build transform (ported from solid-hybrid's `vite-plugin-island-meta`)
 assigns a stable ID, records the component's import source, SSRs its content
@@ -228,10 +240,12 @@ A property worth designing around: island SSR output is frozen at build
 time and server-side Jinja never touches island markup (§4.4), so a leaf
 island page's fragment contains **no substitution slots at all** — it is
 always `static`-class, served as raw bytes from CDN, with its data riding
-in via the injected JSON blob. A static shell layout plus a leaf island
+in via pushes and the self-fetch rule (§4.5). A static shell layout plus a leaf island
 page is the intended shape for a simple SPA: zero origin rendering, still
 fully dynamic after hydration. This is the pattern §5 advises pushing sites
 toward, expressed as a filename.
+
+> @nate: so self-fetch rule only makes sense for static fragments?
 
 ### 3.6 Intercepting and parallel routes
 
@@ -274,7 +288,9 @@ const userInfo = pageQuery<UserInfo>('/user-info', {
 - Bare `'param'`/`'search'` mean "any/all of them". Named forms
   (`'param:locale'`) are required for prerender coverage analysis and enable
   precise cache keying.
-- `inputs: []` declares a constant: fetched once at server startup.
+- `inputs: []` declares a value that varies on nothing in the request: the
+  zero-input case of `route` class — rendered on first request, cacheable
+  indefinitely (§5).
 - **Omitted `inputs` defaults to `['request']`** — private, uncacheable.
   Cacheability is always opt-in; the failure mode of forgetting is slowness,
   never leakage.
@@ -308,7 +324,7 @@ function ProfilePage() {
 
 During the build render the proxy **records every query and field path
 accessed per fragment**. This recording drives: class derivation (§5),
-manifest `queries` lists, preload sets, and JSON pruning (§4.4).
+manifest `queries` lists, self-fetch sets, and push pruning (§4.5).
 
 `<CacheControl>` is a colocated **tightening override** layered on the
 derived default; it never loosens. Composition rule everywhere: **most
@@ -396,14 +412,19 @@ Mechanics:
 - At build time it resolves only if the build has data for it (prerendering,
   §6); otherwise it stays pending and the nearest suspense boundary's
   fallback is frozen into the island's SSR output.
-- At runtime the server injects a pruned JSON blob (a `<script>` *before*
-  the island markup in document order), so the signal resolves synchronously
-  at hydration. Island SSR output is **frozen after build** — server-side
-  Jinja never touches island markup. The cost: non-prerendered
+- At runtime the signal reads the query cache, which is fed by **pushes**
+  (§4.5) — inline scripts embedded in fragment bytes by whoever rendered
+  the fragment — and by the client self-fetch rule for anything no fragment
+  ran. When the data rode in with the HTML, the signal resolves
+  synchronously at hydration. Island SSR output is **frozen after build** —
+  server-side Jinja never touches island markup. The cost: non-prerendered
   `usePageQuery` content shows its fallback between paint and hydration
-  (no network wait — the data rode in with the HTML).
-- The static lens path lets the build **prune the injected JSON to the union
-  of accessed paths** per route, and doubles as an access manifest.
+  (plus a fetch round-trip when the query was island-only, §4.5).
+- The static lens path lets the build **prune each query's pushes to the
+  union of lens paths accessed anywhere in the app** for that query (one
+  global prune set per query, recorded in `schema.json` — pushes are
+  per-fragment artifacts shared across routes, so the prune set cannot be
+  per-route), and doubles as an access manifest.
 
 > @nate: `usePageQuery` technically cannot always return a promise because `renderToString` will render the non-fallback path iff it sees a non-awaitable value. So for pre-rendered values, they must be returned synchronously (no Promise.resolve), and for values the pre-render should skip, just return a `new Promise(() => {})`
 
@@ -421,7 +442,7 @@ Mechanics:
   its hydration-state script**, not markup alone.
 - **Hydration never overwrites existing DOM content** (`insertExpression`
   is a no-op while hydrating). If frozen markup contains *settled* content
-  whose data differs from the injected JSON, the stale markup is kept
+  whose data differs from the pushed data, the stale markup is kept
   silently while client state holds the new data — no error, no warning.
   This is why snapshot atomicity (§6.4) is a correctness requirement, not
   an optimization: violating it produces silent DOM/state divergence. It
@@ -429,21 +450,93 @@ Mechanics:
   via signal writes *after* hydration completes (which work normally),
   never by racing the hydration pass.
 
-### 4.5 Preload streaming
+### 4.5 Pushes: how query data reaches the client
 
-For hard navigations the server already computes the route's query results
-(it needs them for substitution). It streams them to the client as script
-chunks interleaved with the fragment stream:
+There is **one delivery rule**, symmetric between build and server:
+
+> **Whoever renders a fragment inlines a push for each query it ran,
+> embedded in that fragment's bytes.** The build inlines at build time
+> (prerendered and static-adjacent renders); the server inlines into the
+> output it renders at request time. There is no separate streaming
+> channel — data travels inside fragment bytes, wherever those bytes go
+> (origin response, CDN cache, composed page, soft-nav fetch).
+
+**Wire format.** A push is a self-contained append to a plain array (the
+gtag queue-stub pattern — no ordering dependency on the runtime bundle):
 
 ```html
-<script>__pacifica.push("query", "user-info", {...})</script>
+<script>__pq=self.__pq||[]</script>                      <!-- stub, in <head> -->
+<script>__pq.push(["q","nav",{"items":["…"]}])</script>  <!-- one push -->
 ```
 
-The client bootstrap pipes pushes into the query cache (`query.set`) before
-or during hydration. For prerendered fragments, the streamed data is the
-**snapshot** (§6.4), never a fresh fetch. For soft navigations nothing is
-streamed: PageRouter fires the derived preloads (§9) itself as plain
-fetches.
+The build injects the one-line stub into the `<head>` during the root
+layout render. Pushes execute synchronously during the streaming parse, so
+data is queued before any island entry script runs; the client runtime
+drains `__pq` into the query cache (`query.set`) and replaces `push` when
+it loads. Pushed values are pruned to the query's global lens-path union
+(§4.4).
+
+**Placement.** A push sits at the start of the fragment's bytes — with one
+exception: a fragment whose bytes begin the document (contains the
+doctype/head; only ever the root layout's first piece, on hard nav) gets
+its pushes **appended** instead (its end is just before the first outlet,
+inside `<body>` — legal, and no byte seeking for the renderer). Position
+within the document is not load-bearing — island hydration runs from
+deferred entry scripts, after all inline pushes have executed — only
+same-response delivery is. Fragment
+boundaries are outlet positions — always element child positions — and
+HTML content models permit `<script>` at effectively every such position
+(the "script-supporting elements" clause covers `table`, `tr`, `select`,
+`ul`, `dl`, …). Two positions are **build errors**: an outlet inside a
+raw-text element (`title`, `textarea`, `style` — no legal script position)
+and an outlet inside foreign content (`svg`/`math` — SVG `<script>`
+semantics differ; punted).
+
+> @nate: Not a fan of this arbitrary append positioning special case. Why not make the build smarter and split doctype/html tag (and same for head/body) as separated fragments so we can always be sure to insert pushes so that they're contained by either unclosed head or body?
+
+**Dedup.** Within one render, a layout that ran a query pushes it once, in
+its first piece (document order). Across fragments in one response,
+duplicate pushes of the same query are possible and harmless: within one
+build (or one response) the values are identical by construction, and
+`query.set` is idempotent; last-wins.
+
+**The client self-fetch rule.** A query no fragment ran has no push —
+island-only queries, uncovered on a CDN-served page. The rule is symmetric
+with the delivery rule and needs no marker or mode detection:
+
+> After processing a document (hard nav: `DOMContentLoaded`) or a fetched
+> fragment (soft nav), the client fetches every query in the current
+> route's **client-consumed query set** that has no cache entry, from its
+> endpoint (`queries[name].url`), envelope protocol.
+
+The client-consumed set is derived by the build: queries some island
+actually reads (`usePageQuery` accesses — i.e. a non-empty prune set). A
+query used only in page substitution has no client consumer: it is
+neither pushed nor self-fetched — its data lives in the markup.
+
+If a query was rendered into any fragment of the response, its push
+arrived with that fragment's bytes; anything still missing was never
+coming.
+
+**Query cache classes.** Queries derive a cache class from their `inputs`
+exactly like fragments: `inputs ⊆ params/search` → the endpoint is a
+deterministic GET (params in the URL template, canonical search ordering)
+that is **publicly CDN-cacheable**, with a prebaked `Cache-Control` string
+in `schema.json`; `cookies`/`headers`/`request` → private, always origin.
+Self-fetches of cacheable queries therefore cost a CDN round-trip, not an
+origin one.
+
+**Latency mitigations (optional, never correctness):** prebaked
+`Link: …; rel=preload; as=fetch` strings per route for self-fetched
+queries (origin header or CDN config); composed pages may inline the
+equivalent `<link rel=preload>` at derivation time. And
+`export const prerender = false` (§6.1) forces origin assembly for a
+subtree when single-response delivery is wanted.
+
+**Soft navigation.** Scripts inserted via `innerHTML` never execute;
+PageRouter re-creates each script element found in fetched fragment bytes
+(the same mechanism frozen islands' `_$HY.r` boundary-state scripts
+already require), then applies the self-fetch rule.
 
 ## 5. Rendering classes
 
@@ -452,8 +545,7 @@ The class of every fragment is **derived, never authored**:
 | Inputs used by the fragment's queries | Class | Rendered | Cache-Control default |
 |---|---|---|---|
 | (no queries at all) | `static` | at build | `public, max-age=…, immutable`-style |
-| all `[]` | `startup` | at server startup | long public |
-| ⊆ `{param*, search*}` | `route` | per URL at request time | `public, s-maxage=…, stale-while-revalidate=…` |
+| ⊆ `{param*, search*}` (including all `[]`) | `route` | at request time | `public, s-maxage=…, stale-while-revalidate=…` |
 | any of `cookies`/`headers`/`request` | `request` | per request | `private, no-store` |
 
 - Response headers for a hard nav = meet (most restrictive) of the
@@ -463,9 +555,16 @@ The class of every fragment is **derived, never authored**:
 - `headers` maps to `request` in v1. (A future extension may allow
   `{ header: 'accept-language' }` entries emitting `Vary`; explicitly out of
   scope now.)
-- Startup rendering happens at **server startup**, not deploy time, so
-  environment values differ without rebuilds; the file is a Jinja template
-  either way, one rendering path.
+- **There is no boot-time class.** A fragment whose queries all declare
+  `inputs: []` is the zero-input case of `route`: empty binding, rendered
+  on first request. This preserves the property boot-time rendering was
+  for — values come from the runtime environment, not the build — with
+  better freshness semantics (a zero-input result may still change over
+  time; cache policy handles it, process lifetime doesn't). Zero-input
+  fragments get their own prebaked long-public `Cache-Control` default.
+- The origin **may** memoize `route`-class renders keyed by binding (the
+  class data makes this safe by construction). Pure optimization, never
+  semantics; with a CDN in front it is usually unnecessary.
 - Exact `Cache-Control` strings and `Link` header values are **prebaked into
   the manifest** by the build. The server copies strings.
 
@@ -473,13 +572,34 @@ A per-segment consequence worth designing sites around: one `request`-class
 segment makes the *response* private (hard navs pay for it in headers), but
 soft navs still fetch the other fragments from CDN, and the server only
 executes the dynamic fragment. Push dynamism into leaf fragments, or better,
-into islands + query preloads, and HTML stays cacheable.
+into islands + client-fetched queries, and HTML stays cacheable (§6.6
+tier 2 is this advice made structural).
 
 ## 6. Prerendering (SSG)
 
 Prerendering renders `route`-class content at build time for enumerated
 bindings. It is **per-binding coverage of route-class fragments**, not a
-fifth class.
+fourth class.
+
+**Prerendering is params-only.** A binding assigns route params and
+nothing else — no search, no cookies, no headers. Consequences, each
+load-bearing:
+
+- The prerender cache key is **exactly the URL path bytes** — the same
+  thing CDNs key on natively. Nothing that isn't the URL path can ever
+  address a public prerendered artifact; the cache-key-overlap class of
+  bug (user A's variant served to user B) is structurally impossible here.
+- Every binding component has a **position** in the fragment's own name
+  (`[locale]/products/[id]`), so artifact paths need no canonical key
+  ordering — the path slots are the ordering (§6.5).
+- Content that varies on search (or anything request-borne) is honestly
+  `route`/`request`-class at runtime. Prerendering is the wrong tool for
+  it; the origin serves it with explicit cache semantics.
+
+Corollary constraint, enforced at build: **a fragment's queries may only
+use params from the fragment's own path prefix.** (Otherwise a layout
+fragment could vary on a param declared below it — a key component with no
+path position.)
 
 Invariant that keeps artifact counts sane: **every fragment has exactly one
 build-rendered form** (the "all non-covered queries pending" form — an
@@ -491,7 +611,7 @@ multiplies.
 
 Route files export their prerender matrix; declarations **inherit down the
 route subtree** and compose by cartesian product; deeper routes may extend
-or override:
+or override. Enumerations yield **params only**:
 
 ```tsx
 // src/routes/[locale]/_layout.tsx
@@ -499,7 +619,26 @@ export const prerender = { locale: ['en', 'de', 'fr'] };
 
 // dynamic enumerations allowed; must resolve before the render pass
 export const prerender = async () => ({ id: await fetchAllProductIds() });
+
+// opt-out: no build artifacts for this subtree; every hard nav assembles
+// at the origin (single-response delivery of markup + pushes)
+export const prerender = false;
+
+// opt-in to the EMPTY binding: prerender zero-param fragments in this
+// subtree, resolving their zero-input queries at build time
+export const prerender = true;
 ```
+
+The default — no declaration anywhere on the path — is **no bindings**:
+nothing prerenders. This matters for zero-param fragments: their queries
+are vacuously covered by the empty binding, but baking them at build would
+silently trade away the runtime-env freshness that zero-input `route`
+class exists for (§5). `prerender = true` makes that trade explicit.
+
+`prerender = false` inherits down the subtree like any other declaration.
+It exists for origin-assembly semantics — freshest route-class data per
+request, no build artifacts to invalidate — not for data delivery, which
+works without it (§4.5).
 
 ### 6.2 Data source
 
@@ -510,10 +649,11 @@ The build is just another query client; no build-time coupling to Rust code.
 ### 6.3 Coverage and fulfillment
 
 - A fragment is prerenderable for a binding iff the binding covers **every
-  named input of every query the fragment uses** (known from proxy tracking
-  + declarations). Queries with bare `'param'`/`'search'` require a fully
-  bound enumeration.
-- Prerendered fragments are keyed by **only the inputs they use**: a header
+  named param input of every query the fragment uses** (known from proxy
+  tracking + declarations). Queries with bare `'param'` require a fully
+  bound enumeration. Queries with any `search:*` input are never
+  prerenderable (§6 intro).
+- Prerendered fragments are keyed by **only the params they use**: a header
   reading `param:locale` is keyed `{locale}` alone, so all `/en/**` pages
   share one file. Coalescing is cache keying, not a dedup pass.
 - Because assembly is per-request, prerendering composes **per fragment**:
@@ -525,66 +665,113 @@ The build is just another query client; no build-time coupling to Rust code.
   build resolves covered queries' async signals, deliberately leaves the
   rest pending, and captures the settled render — real content where
   covered, frozen fallbacks elsewhere.
-- **Full-SSG mode:** for routes whose entire sequence is covered for a
-  binding, the build can *optionally* also emit fully composed pages
-  (`.pacifica/composed/`) — whole-page files for dumb static hosting. When
-  all routes are covered, `.pacifica` deploys as a complete static site
-  with no origin server (the old `renderAll` idea, now emergent). The
-  origin server itself never uses composed output; it always assembles.
+- **Composed pages:** for routes whose entire sequence is covered for a
+  binding, the build also emits the whole page into the `html/` URL tree
+  (`html/en/products/42/index.html`, §6.5) — derived by **pure
+  concatenation** of the fragment artifacts in sequence order (pushes are
+  already inside fragment bytes). When all routes are covered, `html/`
+  deploys as a complete static site with no origin server. The origin
+  never uses composed pages; it always assembles.
 
 ### 6.4 Snapshot atomicity (the consistency rule)
 
 A prerendered fragment's markup embeds build-time data, and hydration reads
-server-injected JSON. These must never disagree:
+pushed data. These must never disagree. The push model (§4.5) makes the
+rule **physical** rather than procedural:
 
-> The build writes the query result **snapshots** it used next to the
-> prerendered file. When serving a prerendered fragment, the server injects
-> and streams the **snapshot**, and must not re-run covered queries.
-> Markup + snapshot form one atomic artifact that changes only on rebuild.
+> A prerendered artifact is markup **with its pushes inlined in the same
+> file**, written in one build. Markup and data cannot desync because
+> there is nothing to desync: the server serves the bytes as-is and never
+> re-runs covered queries. The artifact changes only on rebuild.
 
-Uncovered (runtime) queries still stream fresh.
+Uncovered (runtime) queries are delivered fresh — pushed by the server
+fragments that run them, or self-fetched by the client (§4.5).
 
 Empirically load-bearing (spike §11.1c): violating this rule does **not**
 error — Solid hydration silently keeps the stale markup while client state
 holds the fresher data (§4.4). Silent divergence, not a crash, is the
 failure mode this rule prevents.
 
+One constraint this bequeaths to future incremental regeneration: because
+two artifacts may carry pushes of the same (query, binding) pair, the
+regeneration unit for a binding is **all artifacts whose pushes mention an
+affected (query, binding)** — regenerating a subset could put two
+disagreeing pushes in one response (last-wins, silently).
+
 > @nate: We need a stale-while-revalidate shaped escape hatch here so that we serve the prerendered fragment+snapshot on the initial request, but allow revalidation to update the cache. Should differentiate between two modes for SSG results: 1. static meaning never changing and 2. prerendered meaning pre-cached, but revalidated on the first request. Might want to extend the `export const prerender = { ... }` API to be nested, and then include a `cache` property so the user can choose between static and prerendered. Need to think about this.
 
 ### 6.5 Layout on disk and lookup
 
-Deterministic, index-free paths — binding serialized canonically (keys
-sorted, values URL-encoded; hash only if length demands):
+A prerendered artifact's path is the fragment's name with its **bound
+param slots positionally substituted**; unbound slots stay literal (a
+value can never read `[locale]` — brackets get encoded). Deterministic,
+index-free, and every path is also a URL the client can construct:
 
 ```
-.pacifica/prerendered/
-  [locale]/_layout/0.html/
-    locale=en.html
-    locale=en.json          # query snapshots for that render
-    locale=de.html
-    locale=de.json
-  [locale]/products/[id].html/
-    id=42&locale=en.html
-    id=42&locale=en.json
+.pacifica/html/_pacifica/            # reserved prefix inside html/ (§8)
+  en/_nav/0.html                     # [locale]/_nav/0 for {locale: en}
+  de/_nav/0.html
+  en/products/42.html                # [locale]/products/[id] for {locale: en, id: 42}
+  en/products/[id].html              # a fragment that used only locale: unused slot literal
 ```
 
-> @nate/@claude (2026-07-04): the binding→filename encoding above is under
-> review — parameter values are arbitrary strings (escaping), and key
-> order in the encoded name must be canonical or lookups are ambiguous. A
-> JSON mapping may replace name-encoded bindings. Don't build against this
-> layout yet.
+**Value encoding.** Param values are written canonically
+percent-encoded: every byte outside unreserved `[A-Za-z0-9._~-]` is
+encoded. One tiny function, byte-identical in the build, both servers, and
+PageRouter. Consequences: no traversal class (encoded values cannot
+contain `/`; a malicious `%2E%2E` stays the literal bytes `%2E%2E`),
+Windows/macOS-inspectable artifacts, and URL round-tripping for free.
+Deploy target is Linux (filenames are byte blobs); one accepted caveat:
+two bindings differing only by letter case collide on a case-insensitive
+dev filesystem (macOS). Build errors: param values of `""`, `.`, `..`, or
+longer than 200 bytes encoded (too long for a path component — not
+prerenderable, falls to runtime).
 
-Server lookup per fragment per request: assemble the binding key from the
-fragment's declared inputs, `stat` the path. Hit → serve those bytes
-(response headers still the sequence meet; prerendered artifacts change
-only on rebuild). Miss → render that fragment at runtime with its derived
-class. String assembly plus a stat; no index to maintain.
+**Lookup** (server, per fragment, per request): substitute the request's
+params into the fragment name's slots for exactly the fragment's
+`prerender.inputs`, `stat` the path. Hit → serve those bytes as-is
+(pushes included; headers still the sequence meet). Miss → render that
+fragment at runtime with its derived class — a miss (e.g. a non-canonical
+encoding that slipped through normalization) is graceful degradation,
+never a wrong answer. String substitution plus a stat; no index to
+maintain.
 
-Build cost scales with the enumerated matrix; input-keyed coalescing keeps
+**Composed pages** land in the `html/` URL tree as
+`<encoded-url-path>/index.html` — directory-index style, the convention
+every dumb host honors without rewrite rules. Catch-all param values
+contain slashes and simply become nested directories in URL space.
+
+The build also emits `html/_pacifica/bindings.json` (path → binding, for
+humans and tooling). **No runtime reads it** — it is not an index in the
+lookup sense.
+
+Build cost scales with the enumerated matrix; param-keyed coalescing keeps
 shared fragments to one render each. Incremental/on-demand regeneration of
-single bindings is future work; the separate `prerendered/` directory
-(data-dependent, unlike the build-deterministic rest of `.pacifica`) is
-what keeps that door open.
+single bindings is future work (see the §6.4 regeneration-unit
+constraint); the binding-keyed artifacts being additive files is what
+keeps that door open.
+
+### 6.6 Deployment tiers
+
+The build classifies every route from data it already has (classes,
+coverage, query lists) and records the site's tier in the manifest:
+
+1. **Pure static** — every route's sequence fully covered, no uncovered
+   queries anywhere: `html/` alone is the deployment. No origin.
+2. **Static + API origin** — HTML entirely from CDN (`html/`); an origin
+   exists only for query/action endpoints. Uncovered `usePageQuery` —
+   including `cookies`-based personalization — works via the self-fetch
+   rule. The origin never assembles HTML. This is the mcmaster shape:
+   a personalized site whose HTML never leaves the CDN.
+3. **Full origin** — any route with `request`-class *fragments* (session
+   data in page substitution rather than islands) needs origin-assembled
+   HTML for those routes.
+
+> @nate: Isn't there another tier between (2) and (3)? Where some pages and/or partials are rendered server-side with the rest served from CDN? Also, I'm pretty sure this hybrid tier is the one mcmaster actually falls into. I doubt all of their HTML is completely pre-rendered. There's very likely some server side rendering happening. Anyways, the point here is that it's important to make clear that `html/` and `fragments/` are neither either-or; they can be used together for a single website.
+
+The build should say *why* a route landed in a tier ("`user-info` is used
+in page substitution here — that forces origin serving; move it into an
+island to stay static").
 
 ## 7. Build pipeline
 
@@ -605,35 +792,52 @@ the v2 route parser):
    queries resolved from `--query-origin` (§6).
 5. **Fragment split** — split each layout's output at its outlet markers
    into named fragments; markers exist only inside this step. Derive each
-   route's sequence.
+   route's sequence. Inline pushes for the queries each render ran (§4.5);
+   inject the queue stub into the root layout's head.
 6. **Client entry codegen** — per route: hydration entries for its islands,
    IslandRouter bootstrap for island subtrees, the PageRouter runtime.
 7. **Client build** — `vite build` → `.build/client/bundle` + Vite manifest.
 8. **Manifest assembly** — join both Vite manifests to map every fragment
    and route to its assets (transitive chunk graph, CSS dedup,
-   server-emitted CSS); derive classes; prebake `Cache-Control` and `Link`
-   strings; sort route children by specificity; write `manifest.json`,
-   `schema.json`, copy assets/public, write prerendered artifacts +
-   snapshots; optionally emit `composed/` for fully covered routes (§6.3).
+   server-emitted CSS); derive classes and deployment tier; prebake
+   `Cache-Control` and `Link` strings; sort route children by specificity;
+   write `manifest.json` and `schema.json`; populate `html/` (assets,
+   public, static-class fragments, prerendered artifacts under the
+   reserved prefix, composed pages for covered routes, `bindings.json`)
+   and `fragments/` (route/request templates).
 
 ## 8. `.pacifica` directory
 
 The `.pacifica` directory **is the server API.** Stability of this layout is
 a compatibility promise.
 
+The organizing invariant: **`html/` holds every byte that is final at
+build time; `fragments/` holds everything that still needs execution.**
+`html/` is the complete CDN sync target with no filtering — `rsync html/
+cdn:/` is the whole static-deploy story, and every project has one (at
+minimum assets + public), whether or not it prerenders anything.
+
 ```
 .pacifica/
-  manifest.json      # everything the server needs to decide anything
-  schema.json        # query contracts + variable schema (Rust codegen input)
-  fragments/         # named fragments: pages and split layouts (§3.2)
-  prerendered/       # binding-keyed fragments + snapshots (§6.5)
-  composed/          # optional: whole pages for static hosting (§6.3)
-  static/            # hashed client assets (js/css/fonts…)
-  public/            # user's public dir, copied verbatim
+  manifest.json           # everything the server needs to decide anything
+  schema.json             # query contracts, cache strings, prune sets (Rust codegen input)
+  fragments/              # Jinja templates only: route/request classes, executed per request
+    _root/0.html
+    account/orders.html
+  html/                   # final at build; served as-is (CDN or origin)
+    public/…              # user's public dir, copied verbatim
+    static/…              # hashed client assets (js/css/fonts…)
+    _pacifica/            # reserved prefix: fragment artifacts at constructible paths
+      about.html          #   static-class single forms
+      en/_nav/0.html      #   prerendered, params positionally substituted (§6.5)
+      en/products/42.html
+      bindings.json       #   debug map, no runtime reads it
+    en/products/42/index.html   # composed pages, URL space (§6.5)
 ```
 
-Fragment files are Jinja-executable; `static`-class fragments simply contain
-no Jinja syntax.
+The reserved prefix (`_pacifica/`, configurable) is a **build error** if a
+user route collides with it. Files in `fragments/` are Jinja-executable
+templates; everything under `html/` is bytes.
 
 ### 8.1 Fragment naming
 
@@ -645,7 +849,8 @@ them:
   `[name]` syntax as the filesystem — one param representation everywhere.
 - **Fragment space** — filesystem-shaped: fragment names mirror the source
   tree under `src/routes/` verbatim, minus the `.tsx`/`.ts` extension.
-  Used as artifact paths under `fragments/` and as keys in the manifest's
+  Used as artifact paths (under `fragments/` or `html/_pacifica/`,
+  depending on class — see below) and as keys in the manifest's
   `fragments` section.
 
 Rules:
@@ -669,38 +874,48 @@ Rules:
   sequences.
 
 Fragment names are **opaque tokens** everywhere downstream. A sequence is a
-list of them, and each token is simultaneously the key into the manifest's
-`fragments` section and the relative path under `fragments/` (append
-`.html`). Nothing ever parses a fragment name — brackets, parens, `_`, `!`
-are just bytes. Matching, the one job that historically forced name-encoded
-conventions (`%`, `*`, `?`), instead uses the route tree's explicit
-`segment`/`param` fields. Mirroring the filesystem also makes the alphabet
-Windows-legal by construction: `[id]`, `(group)`, `@slot`, `!404` are valid
-NTFS names, unlike `:id` or `*404`.
+list of them; each token is the key into the manifest's `fragments`
+section, and that entry's `class` decides where the bytes live: `static` →
+`html/_pacifica/<name>.html` (final bytes), `route`/`request` →
+`fragments/<name>.html` (template), prerender hits →
+`html/_pacifica/<substituted name>.html` (§6.5). Nothing ever parses a
+fragment name — brackets, parens, `_`, `!` are just bytes; substitution
+fills slots the manifest already names. Matching, the one job that
+historically forced name-encoded conventions (`%`, `*`, `?`), instead uses
+the route tree's explicit `segment`/`param` fields. Mirroring the
+filesystem also makes the alphabet Windows-legal by construction: `[id]`,
+`(group)`, `@slot`, `!404` are valid NTFS names, unlike `:id` or `*404`.
 
-Example:
+Example (fragment names → where their bytes live; classes assumed):
 
 ```
-src/routes/                        .pacifica/fragments/
-  _root.tsx                          _root/0.html, _root/1.html
-  (home).tsx                         (home).html
-  about.tsx  + about.script.ts       about.html            (script → assets)
-  !404.tsx                           !404.html
-  (marketing)/_layout.tsx            (marketing)/_layout/0.html, …/1.html
-  (marketing)/pricing.tsx            (marketing)/pricing.html
-  [locale]/products/[id].tsx         [locale]/products/[id].html
+src/routes/                        artifact
+  _root.tsx                          fragments/_root/{0,1}.html        (route: site-config)
+  (home).tsx                         html/_pacifica/(home).html        (static)
+  about.tsx  + about.script.ts       html/_pacifica/about.html         (static; script → assets)
+  !404.tsx                           html/_pacifica/!404.html          (static)
+  (marketing)/_layout.tsx            html/_pacifica/(marketing)/_layout/{0,1}.html
+  (marketing)/pricing.tsx            fragments/(marketing)/pricing.html (route: plans)
+  [locale]/_nav.tsx                  fragments/[locale]/_nav/{0,1}.html (route: nav)
+                                     + html/_pacifica/{en,de}/_nav/{0,1}.html (prerendered)
+  [locale]/products/[id].tsx         fragments/[locale]/products/[id].html
+  account/orders.tsx                 fragments/account/orders.html     (request: orders)
   dashboard/_dash.island.tsx         (no fragment — baked into sub-routes)
-  dashboard/settings.tsx             dashboard/settings.html   (frozen island SSR)
-  app.island.tsx                     app.island.html
+  dashboard/settings.tsx             html/_pacifica/dashboard/settings.html (static, frozen island SSR)
+  app.island.tsx                     html/_pacifica/app.island.html    (static)
 ```
 
 ## 9. `manifest.json`
 
-Sections: `version`, `routes`, `sequences`, `fragments`, `queries`.
+Sections: `version`, `tier`, `routes`, `sequences`, `fragments`,
+`queries`. (A complete worked example is in §13.)
+
+> @nate: I understand this "deployment tier" idea as a concept, but I really am not sure if it serves any useful purpose outside of the spec.
 
 ```jsonc
 {
   "version": 1,
+  "tier": 2,                                // deployment tier (§6.6)
 
   "routes": {
     "segment": "/",
@@ -721,7 +936,7 @@ Sections: `version`, `routes`, `sequences`, `fragments`, `queries`.
         "segment": "dashboard",
         "islandRouter": { "base": "/dashboard", "actionBase": "/actions" },
         "sequence": "/dashboard",
-        "children": [ /* island sub-routes: own sequences & preloads */ ]
+        "children": [ /* island sub-routes: own sequences */ ]
       }
     ]
     // reserved: "slots", "intercept" (parsed today, runtime later)
@@ -741,19 +956,18 @@ Sections: `version`, `routes`, `sequences`, `fragments`, `queries`.
   },
 
   "fragments": {
-    "_root/0":    { "class": "startup", "queries": ["site-config"],
-                    "cacheControl": "…" },
-    "_root/1":    { "class": "startup", "queries": ["site-config"],
+    "_root/0":    { "class": "route", "queries": ["site-config"],
+                    "cacheControl": "…" },      // zero-input route class
+    "_root/1":    { "class": "route", "queries": ["site-config"],
                     "cacheControl": "…" },
     "products/[id]": { "class": "route", "queries": ["product"],
                     "cacheControl": "…",
-                    "prerender": { "inputs": ["param:id", "param:locale"] } }
+                    "prerender": { "inputs": ["param:id"] } }
   },
 
   "queries": {
     "site-config": { "url": "/api/site-config", "inputs": [] },
-    "product":     { "url": "/api/products/{id}",
-                     "inputs": ["param:id", "param:locale"] },
+    "product":     { "url": "/api/products/{id}", "inputs": ["param:id"] },
     "user-info":   { "url": "/api/user-info", "inputs": ["cookies"] }
   }
 }
@@ -768,11 +982,12 @@ Notes:
 - Param segments use the filesystem's `[name]` syntax — one param
   representation everywhere. Matchers identify param nodes by the `param`
   field; the segment string of a param node is never parsed.
-- There is **no `preloads` field**: the queries to prefetch/stream for a
-  route are derived as the union of its sequence fragments' `queries`
-  lists (island sub-route fragments carry their query lists like any
-  other fragment). Denormalizing this back into the route tree is a
-  possible later optimization, not a manifest shape.
+- There is **no `preloads` field**: a route's client-consumed query set
+  (§4.5) is derived from its sequence fragments' `queries` lists
+  intersected with the client-consumed queries in `schema.json` (island
+  sub-route fragments carry their query lists like any other fragment).
+  Denormalizing this back into the route tree is a possible later
+  optimization, not a manifest shape.
 - Fallbacks are not URLs, so their sequences are keyed by fragment-space
   name (`"/!404"`); sequence keys are route paths *or* fallback names.
 - Invariant: **every decision a server or client router must make is a
@@ -785,30 +1000,38 @@ Notes:
 Any conforming server (reference implementation: TypeScript; production
 target: Rust — a *port*, started only once this spec stabilizes):
 
-1. Load `manifest.json` at startup. Render `startup`-class fragments once
-   (constant queries fetched at boot).
+1. Load `manifest.json` at startup. **No boot-time rendering** — there is
+   no startup work beyond reading the manifest (§5).
 2. Per request: match segments against `routes` (children are pre-sorted;
    walk in order, extract params). Miss → nearest `fallback.404`.
 3. Determine the unit: a single fragment if the request carries the
    soft-nav indicator (header `X-Pacifica-Partial` or equivalent), else the
    route's sequence.
 4. For each fragment, in sequence order:
-   a. Prerender check (§6.5): binding-key path hit → those bytes, and note
-      its snapshot for injection/streaming.
-   b. `static`/`startup` → cached bytes.
+   a. Prerender check (§6.5): substitute the request's params into the
+      fragment name for the fragment's `prerender.inputs`, stat under
+      `html/_pacifica/`. Hit → those bytes as-is (pushes included).
+   b. `static` → the bytes at `html/_pacifica/<name>.html`, as-is.
    c. Otherwise run the fragment's `queries` (context restricted to each
-      query's declared `inputs`) and execute the fragment's template (Jinja
-      subset; engine parity plan: minijinja in Rust / minijinja-js in the
-      reference server — punted until templating DX is settled).
-   Stream fragments in order as they are ready; interleave the pruned
-   page-query JSON and preload script chunks (snapshots for prerendered
-   fragments, fresh results otherwise).
+      query's declared `inputs`), execute the fragment's template from
+      `fragments/` (Jinja subset; engine parity plan: minijinja in Rust /
+      minijinja-js in the reference server — punted until templating DX is
+      settled), and **inline a push for each query it ran** at the start
+      of the rendered bytes (§4.5).
+   Stream fragments in document order as they become ready. There is no
+   separate data channel: pushes are inside fragment bytes.
 5. Copy the sequence's prebaked `cacheControl` and `linkHeader` strings
    (fragment-level strings when serving a lone fragment). Optionally emit
    `103 Early Hints` from `linkHeader` (proven in the solid-hybrid PoC).
-6. Serve `static/` and `public/` with immutable/long cache headers.
+6. Serve `html/` as static files (immutable/long cache headers for
+   `static/`, per-manifest strings elsewhere). A CDN may front or replace
+   this entirely (§6.6).
 7. Query/action endpoints respond with the envelope (§4.3), content-
-   negotiating JSON vs `303` for no-JS form posts.
+   negotiating JSON vs `303` for no-JS form posts. Endpoint `Cache-Control`
+   strings come prebaked from `schema.json` per the query's cache class
+   (§4.5).
+8. The origin may additionally memoize `route`-class renders keyed by
+   binding (§5). Optional; never semantics.
 
 ## 11. Sequencing
 
@@ -849,7 +1072,7 @@ target: Rust — a *port*, started only once this spec stabilizes):
    plus sequence assembly/streaming.
 6. PageRouter runtime (§3.3).
 7. Queries: `pageQuery`, proxy tracking, envelope wrappers, `usePageQuery`,
-   preload streaming, revalidation routing.
+   pushes + client self-fetch, revalidation routing.
 8. Prerendering (§6).
 9. Dev server (Vite middleware + `ssrLoadModule`, same manifest shapes).
 10. Intercept/parallel runtime (§3.6).
@@ -865,13 +1088,377 @@ target: Rust — a *port*, started only once this spec stabilizes):
   prerender binding cartesian at the template level, forced whole-page
   Jinja execution when any segment was dynamic, duplicated artifacts, and
   blocked fragment-order streaming. Composed whole pages survive only as
-  the optional `composed/` output for static hosting (§6.3).
+  a derived output (pure concatenation) in the `html/` URL tree for dumb
+  static hosting (§6.3, §6.5).
 - **seroval / JS server functions** — rejected; plain JSON envelope against
   typed contracts.
 - **SSE for preload delivery** — rejected; script chunks + client fetches.
+- **A `startup` render class** (boot-time rendering of zero-input
+  fragments) — collapsed into `route` as the empty-binding case
+  (2026-07-04): first-request rendering preserves runtime-env values with
+  better freshness semantics, and the server gets zero boot-time work.
+- **A server-streamed preload channel separate from fragment bytes** —
+  superseded by renderer-inlined pushes + the client self-fetch rule
+  (§4.5): CDN-served bytes carry their own data; no marker, no serving-mode
+  detection.
+- **Search/cookie/header inputs in prerender bindings** — rejected
+  (2026-07-04); prerendering is params-only, keyed by URL path bytes
+  (§6). Search-varying content is `route`-class at runtime.
+- **Name-encoded binding keys with canonical key ordering (`id=42&locale=en`)
+  and hashed binding keys** — both superseded by positional substitution
+  into the fragment name's param slots (§6.5), which params-only
+  prerendering made possible.
 - **Island props from page data** (`$query` prop references) — rejected in
   favor of `usePageQuery`; island SSR markup stays frozen, nothing is
   prop-lowered.
 - **Authored cache classes** (`site|route|request` as user-facing scopes) —
   rejected; classes are derived from query `inputs`, overrides only tighten.
 - **JS SSR at request time** — the founding non-goal.
+
+## 13. Worked example
+
+One application exercising every mechanism. Everything below maps back to
+a numbered section.
+
+### 13.1 Source
+
+```
+src/routes/
+  _root.tsx              # html shell; uses site-config (inputs: []);
+                         #   contains a ThemeToggle island reading site-config
+  (home).tsx             # index alias (§3.1); no queries
+  about.tsx              # no queries
+  !404.tsx               # fallback (§3.1)
+  [locale]/
+    _nav.tsx             # uses nav (inputs: [param:locale]);
+                         #   exports prerender = { locale: ["en", "de"] }
+    products/
+      index.tsx          # uses product-list (param:locale, search:page)
+      [id].tsx           # uses product (param:id, param:locale);
+                         #   contains a BuyButton island reading product via
+                         #   usePageQuery; prerender extends { id: [42, 43] }
+  account/
+    orders.tsx           # uses orders (inputs: [cookies]); no islands
+  dashboard/
+    _dash.island.tsx     # island boundary (§3.4)
+    index.tsx            # island sub-routes; settings reads user-info
+    settings.tsx         #   (inputs: [cookies]) via usePageQuery
+  app.island.tsx         # leaf island page (§3.5)
+```
+
+Derived classes (§5): `(home)`, `about`, `!404`, `dashboard/*`,
+`app.island` → `static`; `_root/*` → `route` (zero-input);
+`[locale]/_nav/*`, `[locale]/products/*` → `route`;
+`account/orders` → `request`. Deployment tier (§6.6): **3**, and the build
+says why: *orders is used in page substitution in `account/orders` —
+that route needs origin assembly. Every other route is tier ≤ 2.*
+
+Prerender coverage (§6.3): `_nav` pieces for `{en, de}`;
+`products/[id]` for `{en, de} × {42, 43}`; `products/index` never
+(search input). Client-consumed queries (§4.5): `site-config`
+(ThemeToggle), `product` (BuyButton), `user-info` (settings island).
+`nav`, `product-list`, `orders` have no island consumers: never pushed,
+never self-fetched — their data lives in markup.
+
+### 13.2 `.pacifica`
+
+```
+.pacifica/
+  manifest.json
+  schema.json
+  fragments/                             # templates, executed per request (§8)
+    _root/0.html
+    _root/1.html
+    [locale]/_nav/0.html
+    [locale]/_nav/1.html
+    [locale]/products/index.html
+    [locale]/products/[id].html
+    account/orders.html
+  html/                                  # final bytes; the CDN sync target (§8)
+    public/…
+    static/root-D3ax.css
+    static/root-9k2a.js …
+    _pacifica/                           # reserved prefix (§8)
+      (home).html
+      about.html
+      !404.html
+      app.island.html
+      dashboard/index.html
+      dashboard/settings.html
+      en/_nav/0.html                     # prerendered (§6.5)
+      en/_nav/1.html
+      de/_nav/0.html
+      de/_nav/1.html
+      en/products/42.html
+      en/products/43.html
+      de/products/42.html
+      de/products/43.html
+      bindings.json
+    en/products/42/index.html            # composed pages (§6.5): the four
+    en/products/43/index.html            #   fully covered product bindings
+    de/products/42/index.html
+    de/products/43/index.html
+```
+
+No composed pages exist for `/`, `/about`, etc. — their sequences contain
+`_root/*` (`route`-class, not covered; no `prerender = true` here), so
+hard navs to them assemble at the origin. `/en/products/42` is fully
+covered only because every fragment in its sequence has a prerendered (or
+static) form… except `_root/*` — so strictly, composed pages for it
+require `prerender = true` at the root too. The example assumes the root
+declares it; this is the kind of consequence §6.6's "say why" exists for.
+
+> @nate: Ok I need clarity on what this is all about "The example assumes the root declares it; this is the kind of consequence §6.6's "say why" exists for." I have no idea what this means.
+
+### 13.3 `manifest.json`
+
+```jsonc
+{
+  "version": 1,
+  "tier": 3,
+  "routes": {
+    "segment": "/", "sequence": "/",
+    "fallback": { "404": { "sequence": "/!404" } },
+    "children": [                        // pre-sorted: static > param (§3.3)
+      { "segment": "about",   "sequence": "/about" },
+      { "segment": "account", "children": [
+          { "segment": "orders", "sequence": "/account/orders" } ] },
+      { "segment": "app",     "sequence": "/app" },
+      { "segment": "dashboard", "sequence": "/dashboard",
+        "islandRouter": { "base": "/dashboard", "actionBase": "/actions" },
+        "children": [
+          { "segment": "settings", "sequence": "/dashboard/settings" } ] },
+      { "segment": "[locale]", "param": "locale", "children": [
+          { "segment": "products", "sequence": "/[locale]/products",
+            "children": [
+              { "segment": "[id]", "param": "id",
+                "sequence": "/[locale]/products/[id]" } ] } ] }
+    ]
+  },
+
+  "sequences": {
+    "/":                        { "fragments": ["_root/0", "(home)", "_root/1"],
+                                  "cacheControl": "…", "linkHeader": "…",
+                                  "assets": { "css": ["root-D3ax.css"],
+                                              "jsEntry": "root-9k2a.js",
+                                              "jsImports": ["chunk-solid-Bf1x.js"] } },
+    "/about":                   { "fragments": ["_root/0", "about", "_root/1"], "…": "…" },
+    "/!404":                    { "fragments": ["_root/0", "!404", "_root/1"], "…": "…" },
+    "/[locale]/products":       { "fragments": ["_root/0", "[locale]/_nav/0",
+                                    "[locale]/products/index",
+                                    "[locale]/_nav/1", "_root/1"], "…": "…" },
+    "/[locale]/products/[id]":  { "fragments": ["_root/0", "[locale]/_nav/0",
+                                    "[locale]/products/[id]",
+                                    "[locale]/_nav/1", "_root/1"],
+                                  "cacheControl": "public, s-maxage=300, stale-while-revalidate=3600",
+                                  "…": "…" },
+    "/account/orders":          { "fragments": ["_root/0", "account/orders", "_root/1"],
+                                  "cacheControl": "private, no-store", "…": "…" },
+    "/dashboard":               { "fragments": ["_root/0", "dashboard/index", "_root/1"], "…": "…" },
+    "/dashboard/settings":      { "fragments": ["_root/0", "dashboard/settings", "_root/1"], "…": "…" },
+    "/app":                     { "fragments": ["_root/0", "app.island", "_root/1"], "…": "…" }
+  },
+
+  "fragments": {
+    "_root/0":                  { "class": "route",  "queries": ["site-config"], "cacheControl": "…" },
+    "_root/1":                  { "class": "route",  "queries": ["site-config"], "cacheControl": "…" },
+    "(home)":                   { "class": "static", "queries": [], "cacheControl": "…" },
+    "about":                    { "class": "static", "queries": [], "cacheControl": "…" },
+    "!404":                     { "class": "static", "queries": [], "cacheControl": "…" },
+    "[locale]/_nav/0":          { "class": "route",  "queries": ["nav"], "cacheControl": "…",
+                                  "prerender": { "inputs": ["param:locale"] } },
+    "[locale]/_nav/1":          { "class": "route",  "queries": ["nav"], "cacheControl": "…",
+                                  "prerender": { "inputs": ["param:locale"] } },
+    "[locale]/products/index":  { "class": "route",  "queries": ["product-list"], "cacheControl": "…" },
+    "[locale]/products/[id]":   { "class": "route",  "queries": ["product"], "cacheControl": "…",
+                                  "prerender": { "inputs": ["param:locale", "param:id"] } },
+    "account/orders":           { "class": "request", "queries": ["orders"], "cacheControl": "…" },
+    "dashboard/index":          { "class": "static", "queries": ["user-info"], "cacheControl": "…" },
+    "dashboard/settings":       { "class": "static", "queries": ["user-info"], "cacheControl": "…" },
+    "app.island":               { "class": "static", "queries": [], "cacheControl": "…" }
+  },
+
+  "queries": {
+    "site-config":  { "url": "/api/site-config", "inputs": [] },
+    "nav":          { "url": "/api/nav/{locale}", "inputs": ["param:locale"] },
+    "product-list": { "url": "/api/products", "inputs": ["param:locale", "search:page"] },
+    "product":      { "url": "/api/products/{locale}/{id}", "inputs": ["param:locale", "param:id"] },
+    "orders":       { "url": "/api/orders", "inputs": ["cookies"] },
+    "user-info":    { "url": "/api/user-info", "inputs": ["cookies"] }
+  }
+}
+```
+
+(`"…"` elides prebaked strings and asset lists for brevity; real files are
+fully populated. `dashboard/settings` is `static` — frozen island bytes —
+yet lists `user-info`: the query list drives the self-fetch set, not
+rendering.)
+
+`schema.json` carries the per-query contract for the Rust side and the
+client: endpoint, inputs, derived cache class + prebaked `Cache-Control`
+for the endpoint (§4.5), and the global prune set (§4.4):
+
+```jsonc
+{
+  "product": {
+    "url": "/api/products/{locale}/{id}",
+    "inputs": ["param:locale", "param:id"],
+    "cacheControl": "public, s-maxage=300, stale-while-revalidate=3600",
+    "prune": ["name", "price"]            // union of usePageQuery lens paths
+  },
+  "user-info": {
+    "url": "/api/user-info",
+    "inputs": ["cookies"],
+    "cacheControl": "private, no-store",
+    "prune": ["name", "email"]
+  }
+  // …
+}
+```
+
+### 13.4 Fragment files
+
+A **template** (`route`-class, origin-executed):
+`fragments/[locale]/products/[id].html`
+
+```html
+<article class="product">
+  <h1>{{ product.name }}</h1>
+  <p class="price">{{ product.price }}</p>
+  {% for tag in product.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+  <div data-island="products/[id]#0"><button disabled>Buy</button><script>
+  (self._$HY=self._$HY||{r:{}}).r["i0"]="$$f"</script></div>
+</article>
+```
+
+The island region (`BuyButton`) is frozen build bytes spliced into the
+template (§4.2) — Jinja never touches it; it shows its serialized fallback
+(`$$f`, §4.4) until hydration. Island markup/attribute details here are
+illustrative; exact shapes are fixed by the island port (§11.3).
+
+The **prerendered artifact** for `{locale: en, id: 42}`:
+`html/_pacifica/en/products/42.html`
+
+```html
+<script>__pq.push(["q","product",{"name":"Rust Book","price":"$40"}])</script>
+<article class="product">
+  <h1>Rust Book</h1>
+  <p class="price">$40</p>
+  <span class="tag">books</span><span class="tag">systems</span>
+  <div data-island="products/[id]#0"><button>Buy — $40</button></div>
+</article>
+```
+
+Everything settled: substitution done, the island captured in its
+**settled** state (covered query, §6.3), the push inlined at the start of
+the fragment's bytes (§4.5) and pruned to `["name","price"]`. This file is
+served verbatim by CDN or origin; the pushed data and the markup cannot
+disagree (§6.4).
+
+A **frozen island fragment** (`static`-class, uncovered query):
+`html/_pacifica/dashboard/settings.html`
+
+```html
+<div data-island="dashboard/settings#0">
+  <section><h2>Settings</h2><p>Loading profile…</p></section>
+  <script>(self._$HY=self._$HY||{r:{}}).r["s0"]="$$f"</script>
+</div>
+```
+
+No push — `user-info` is `cookies`-class, never build-resolvable. The
+client self-fetches it (§4.5); the fallback shows until the signal write
+lands (§4.4).
+
+### 13.5 A hard navigation, origin-assembled: `GET /en/products/42`
+
+Match walks the tree: `[locale]` binds `en`, `products` static, `[id]`
+binds `42` → sequence `/[locale]/products/[id]` (§10.2). Headers copied
+from the sequence entry. Then, per fragment in order (§10.4):
+
+| fragment | path checked | result |
+|---|---|---|
+| `_root/0` | (no prerender inputs → no stat) | `route`: run `site-config`, execute template, **append** push (doctype exception, §4.5) |
+| `[locale]/_nav/0` | `html/_pacifica/en/_nav/0.html` | hit → bytes as-is (no push: `nav` has no client consumer) |
+| `[locale]/products/[id]` | `html/_pacifica/en/products/42.html` | hit → bytes as-is (push inside) |
+| `[locale]/_nav/1` | `html/_pacifica/en/_nav/1.html` | hit → bytes |
+| `_root/1` | — | `route`: `site-config` already run this response → no re-run, no duplicate push |
+
+Wire shape (structure, not literal bytes):
+
+```html
+<!doctype html><html><head>
+  <script>__pq=self.__pq||[]</script>          <!-- stub, build-injected (§4.5) -->
+  <link rel="stylesheet" href="/static/root-D3ax.css"> …
+</head><body><header>…theme toggle island…</header><main>
+<script>__pq.push(["q","site-config",{"theme":"dark"}])</script>  <!-- _root/0, appended -->
+<nav>…prerendered en nav…</nav>                                   <!-- en/_nav/0 -->
+<script>__pq.push(["q","product",{"name":"Rust Book","price":"$40"}])</script>
+<article class="product">…settled…</article>                      <!-- en/products/42 -->
+<aside>…en nav footer…</aside>                                    <!-- en/_nav/1 -->
+</main><footer>…</footer></body></html>                           <!-- _root/1 -->
+```
+
+The composed page `html/en/products/42/index.html` is this same byte
+stream minus the runtime `_root` renders — which is why it only exists if
+the root subtree opts into `prerender = true` (§13.2). At
+`DOMContentLoaded` the client checks the client-consumed set
+{`site-config`, `product`}: both in cache → no self-fetches. Islands
+hydrate; `usePageQuery(product, 'price')` resolves synchronously.
+
+> @claude (2026-07-04): asset tags in `<head>` are an unresolved wrinkle —
+> `_root/0` is one shared fragment, but CSS/JS assets (and titles/meta)
+> vary per route. Options: emit asset tags adjacent to the page fragment
+> (link-in-body is browser-legal), a head-injection point, or per-sequence
+> head fragments. Needs a design discussion; `linkHeader`/Early Hints are
+> unaffected.
+
+> @nate: My solution to the above note by @claude, was figured out in solid-hybrid already. Just pass the assets as build-time subtitution props that the user needs to inject into their HTML document JSX.
+>
+> Example:
+> ```
+> export function RootPage(props: { assets }) {
+>   ...
+>   return (
+>     <html>
+>       <head>
+>       ...
+>       {props.assets}
+>       ...
+>       </head>
+>       ...
+>     </htm>
+>   )
+> }
+> ```
+>
+> That's the rought idea. It's important to remember that Jinja is not the only templating mechanism the user has available to them. They can run arbitrary code in the JSX and load whatever data they want - at build time - to programmatically render the static non-island templates. Pacifica is really a fusion of two different templating systems: JSX and Jinja.
+
+### 13.6 A hard navigation, CDN-served: `GET /dashboard/settings`
+
+Assume tier-2 hosting for this route (its sequence is `static` +
+zero-input `route`… the `_root` pieces again require root
+`prerender = true` for a composed page — same caveat as §13.2). CDN serves
+`html/dashboard/settings/index.html`: static shell, frozen fallback
+island, `site-config` push baked at build. At `DOMContentLoaded` the
+client-consumed set is {`site-config`, `user-info`}; `user-info` has no
+cache entry → self-fetch `/api/user-info` (private, origin) → signal write
+→ fallback swaps to profile (§4.4). HTML never touched the origin;
+personalization happened anyway.
+
+### 13.7 A soft navigation: `/about` → `/en/products/42`
+
+1. Sequence diff (§3.3): shared `_root/*`; needed: `[locale]/_nav/0`,
+   `[locale]/products/[id]`, `[locale]/_nav/1`.
+2. All three are prerender hits for `{locale: en, id: 42}` — PageRouter
+   builds the substituted paths itself (same one encoding function, §6.5)
+   and fetches `/_pacifica/en/_nav/0.html`, `/_pacifica/en/products/42.html`,
+   `/_pacifica/en/_nav/1.html` from CDN, plus the route's CSS/JS from the
+   manifest, in parallel.
+3. Concatenate, swap inside `startViewTransition()`; re-create script
+   elements from the fetched bytes so the `product` push and the island's
+   `_$HY.r` script execute (§4.5).
+4. Hydrate the entering BuyButton island; dispose nothing (none left).
+5. Self-fetch check: client-consumed set now {`site-config`, `product`} —
+   both cached. Done. Had the target been `{id: 99}` (uncovered),
+   step 2 would have fetched `[locale]/products/[id]` from the origin
+   instead (lone-fragment render, push inlined) — same swap, same rules.
