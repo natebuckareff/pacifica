@@ -283,11 +283,20 @@ constraints on the one module that implements the proxy):
 - Access recording filters internal probes (`t`, `h`, `p`, coercion
   methods, symbols, `map`) so only real data paths are recorded.
 - Page/layout build renders use `hydratable: false` — pages never hydrate,
-  and hydration markers would pollute the templates. Whether an
-  island-containing fragment can render in one hydratable pass, or islands
-  must be SSR'd separately (hydratable) and spliced into the non-hydratable
-  page render as frozen `{ t }` bytes, is an open build question (addendum
-  spike pending); the two-pass splice is the known-good default.
+  and hydration markers would pollute the templates. The addendum spike
+  showed one-pass `hydratable: true` rendering is also *viable* — it won't
+  corrupt the template (raw placeholders and the `{% for %}` block survive;
+  the only change is deterministic `_hk` attributes on element start tags) —
+  so a future constraint forcing a single pass would be ugly, not broken.
+  The build nevertheless renders **two-pass**: islands SSR'd hydratable in
+  isolation, frozen bytes spliced into the non-hydratable page render as
+  `{ t }` fragments. Reasons beyond marker-free page shells: Solid numbers
+  hydration keys with a per-render counter, so an island rendered mid-page
+  would get position-dependent `_hk` values that the island's client
+  `hydrate()` call (which numbers from its own root, under its own render
+  id) would have to reproduce — isolated renders make each island's keys
+  self-contained; and each island's serialized boundary-state script
+  (§4.4) stays adjacent to its own markup, per artifact.
 
 ### 4.3 Use in islands (`query`/`action` via solid-router)
 
@@ -343,6 +352,28 @@ Mechanics:
   of accessed paths** per route, and doubles as an access manifest.
 
 > @nate: `usePageQuery` technically cannot always return a promise because `renderToString` will render the non-fallback path iff it sees a non-awaitable value. So for pre-rendered values, they must be returned synchronously (no Promise.resolve), and for values the pre-render should skip, just return a `new Promise(() => {})`
+
+**Hydration behavior** (spike §11.1c, resolved on 2.0.0-beta.14;
+`solid-hydration-overwrite-test/`):
+
+- Frozen-fallback hydration works as this section assumes: hydration
+  returns the fallback for the hydrate pass, then swaps in the real content
+  in a microtask (pre-rAF) — no warnings, no DOM corruption, event handlers
+  attach, siblings outside the boundary hydrate normally. The flash is the
+  fallback being visible from first paint until the island script hydrates.
+- The swap works because Solid serializes **boundary state alongside the
+  markup** (a script setting `_$HY.r[key] = "$$f"` marks the boundary as
+  serialized-fallback). A frozen island artifact is therefore markup **plus
+  its hydration-state script**, not markup alone.
+- **Hydration never overwrites existing DOM content** (`insertExpression`
+  is a no-op while hydrating). If frozen markup contains *settled* content
+  whose data differs from the injected JSON, the stale markup is kept
+  silently while client state holds the new data — no error, no warning.
+  This is why snapshot atomicity (§6.4) is a correctness requirement, not
+  an optimization: violating it produces silent DOM/state divergence. It
+  also constrains any revalidation/SWR mechanism: updates must be applied
+  via signal writes *after* hydration completes (which work normally),
+  never by racing the hydration pass.
 
 ### 4.5 Preload streaming
 
@@ -458,6 +489,11 @@ server-injected JSON. These must never disagree:
 > Markup + snapshot form one atomic artifact that changes only on rebuild.
 
 Uncovered (runtime) queries still stream fresh.
+
+Empirically load-bearing (spike §11.1c): violating this rule does **not**
+error — Solid hydration silently keeps the stale markup while client state
+holds the fresher data (§4.4). Silent divergence, not a crash, is the
+failure mode this rule prevents.
 
 > @nate: We need a stale-while-revalidate shaped escape hatch here so that we serve the prerendered fragment+snapshot on the initial request, but allow revalidation to update the cache. Should differentiate between two modes for SSG results: 1. static meaning never changing and 2. prerendered meaning pre-cached, but revalidated on the first request. Might want to extend the `export const prerender = { ... }` API to be nested, and then include a `cache` property so the user can choose between static and prerendered. Need to think about this.
 
@@ -663,9 +699,10 @@ target: Rust — a *port*, started only once this spec stabilizes):
    a. ~~the tracking-proxy `t`-property technique on 2.0's SSR~~ —
       **RESOLVED** (2026-07-03, `solid-tracking-proxy-text/`): PASS on
       2.0.0-beta.14 with modifications, folded into §4.2 mechanism notes.
-      Open addendum: whether emission survives `hydratable: true`
-      (one-pass island-in-page rendering; two-pass splice works
-      regardless).
+      Addendum also resolved: emission survives `hydratable: true`
+      unchanged (deterministic `_hk` attributes only), so one-pass
+      island-in-page rendering is viable; two-pass splice kept as the
+      default for marker-free page shells.
    b. ~~selective async-signal resolution + settled-render capture with
       frozen suspense fallbacks (build render pass, §6.3)~~ — **RESOLVED**
       (`solid-prerender-test/`): sync value → real content, pending
@@ -673,9 +710,13 @@ target: Rust — a *port*, started only once this spec stabilizes):
       2.0.0-beta.14. This is the source of the §4.4 note (covered values
       must return synchronously; skipped values return a never-resolving
       promise).
-   c. hydration overwriting frozen fallback markup via signals (no mismatch
-      breakage, acceptable flash) — **in progress**
-      (`solid-hydration-overwrite-test/`).
+   c. ~~hydration overwriting frozen fallback markup via signals (no
+      mismatch breakage, acceptable flash)~~ — **RESOLVED** (2026-07-03,
+      `solid-hydration-overwrite-test/`): PASS in Chromium. Fallback swap,
+      clean covered-case hydration, and interactivity all verified; frozen
+      artifacts must include Solid's serialized boundary-state script;
+      hydration never overwrites settled DOM (stale snapshots persist
+      silently) — folded into §4.4 and §6.4.
    A failed spike changes the affected API's *mechanism*, not the
    architecture (e.g. proxy → explicit typed components).
 2. Route matching completion + known parser fixes (`.script.ts` files leak
