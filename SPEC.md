@@ -235,8 +235,8 @@ macro/build script) and by the build itself.
 
 In static JSX, a query result is a **typed tracking proxy** (the solid-hybrid
 `tera.tsx` technique, kept deliberately: typed autocomplete is the point;
-the `t`-property hack is contained behind one module and covered by a spike,
-§11):
+the `t`-property hack is contained behind one module and **proven against
+Solid 2.0.0-beta.14** — spike §11.1a, resolved):
 
 ```tsx
 function ProfilePage() {
@@ -260,6 +260,34 @@ manifest `queries` lists, preload sets, and JSON pruning (§4.4).
 derived default; it never loosens. Composition rule everywhere: **most
 restrictive wins** (across a fragment's queries and CacheControl nodes, and
 across a sequence's fragments for the response headers).
+
+**Proxy mechanism notes** (from the spike, `solid-tracking-proxy-text/`;
+constraints on the one module that implements the proxy):
+
+- Solid 2 SSR still splices `{ t: string }` objects into output unescaped
+  (`ssr`/`tryResolveString`/`resolveSSRNode` in `@solidjs/web`). The proxy
+  must return `undefined` for `h` and `p` — Solid 2 uses those for
+  async/hole-bearing templates, and a proxy answering them is misparsed as
+  a complex SSR template.
+- Text position emits raw `{{ … }}` via the `t` getter (Solid 2 only
+  escapes `<` in text).
+- Generic attributes (`href` etc.) coerce via `Symbol.toPrimitive` inside
+  `ssrAttribute(name, escape(v, true))` and come out as raw `{{ … }}`; the
+  proxy must implement `Symbol.toPrimitive`.
+- `class={proxy}` goes through `ssrClassName`'s class-list object path
+  (`Object.keys`); the proxy fakes it via `ownKeys` +
+  `getOwnPropertyDescriptor`. This is the most implementation-coupled part —
+  if it regresses, reserve an explicit helper for class/style and keep the
+  proxy for text and generic attributes.
+- `.map` emits `{% for item in … %} … {% endfor %}` as raw `{ t }` blocks.
+- Access recording filters internal probes (`t`, `h`, `p`, coercion
+  methods, symbols, `map`) so only real data paths are recorded.
+- Page/layout build renders use `hydratable: false` — pages never hydrate,
+  and hydration markers would pollute the templates. Whether an
+  island-containing fragment can render in one hydratable pass, or islands
+  must be SSR'd separately (hydratable) and spliced into the non-hydratable
+  page render as frozen `{ t }` bytes, is an open build question (addendum
+  spike pending); the two-pass splice is the known-good default.
 
 ### 4.3 Use in islands (`query`/`action` via solid-router)
 
@@ -632,11 +660,22 @@ target: Rust — a *port*, started only once this spec stabilizes):
 ## 11. Sequencing
 
 1. **Spikes first** (all against SolidJS 2.0, all cheap, all load-bearing):
-   a. the tracking-proxy `t`-property technique on 2.0's SSR;
-   b. selective async-signal resolution + settled-render capture with frozen
-      suspense fallbacks (build render pass, §6.3);
+   a. ~~the tracking-proxy `t`-property technique on 2.0's SSR~~ —
+      **RESOLVED** (2026-07-03, `solid-tracking-proxy-text/`): PASS on
+      2.0.0-beta.14 with modifications, folded into §4.2 mechanism notes.
+      Open addendum: whether emission survives `hydratable: true`
+      (one-pass island-in-page rendering; two-pass splice works
+      regardless).
+   b. ~~selective async-signal resolution + settled-render capture with
+      frozen suspense fallbacks (build render pass, §6.3)~~ — **RESOLVED**
+      (`solid-prerender-test/`): sync value → real content, pending
+      promise → `Loading` fallback, in one `renderToString` pass on
+      2.0.0-beta.14. This is the source of the §4.4 note (covered values
+      must return synchronously; skipped values return a never-resolving
+      promise).
    c. hydration overwriting frozen fallback markup via signals (no mismatch
-      breakage, acceptable flash).
+      breakage, acceptable flash) — **in progress**
+      (`solid-hydration-overwrite-test/`).
    A failed spike changes the affected API's *mechanism*, not the
    architecture (e.g. proxy → explicit typed components).
 2. Route matching completion + known parser fixes (`.script.ts` files leak
